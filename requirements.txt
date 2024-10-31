@@ -1,0 +1,6 @@
+langchain_community
+langchain-openai 
+langchain 
+langgraph
+langchain_pinecone
+langchain-anthropic
