@@ -10,6 +10,8 @@ from langchain_core.runnables import RunnableConfig
 
 @dataclass(kw_only=True)
 class Configuration:
+    is_graph_studio: bool = False
+
     @classmethod
     def from_runnable_config(
         cls, config: Optional[RunnableConfig] = None

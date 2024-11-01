@@ -5,7 +5,7 @@ from graph_state import GraphState
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
@@ -39,7 +39,7 @@ openai = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 indexes = ChunkPineconeStore(vectorstore)
 
-prompt = """You are a text processing assistant. Your task is to break a given text into self-contained chunks, each representing a complete thought or idea. Here's the text you'll be working with:
+prompt = """You are a text processing assistant. Your task is to break a given text into self-contained chunks if possible. Here's the text you'll be working with:
 
 <text>{text}</text>
 
@@ -47,7 +47,10 @@ Please follow these steps to process the text:
 
 1. Read and analyze the entire text carefully.
 
-2. Identify natural break points where the text can be divided into self-contained chunks. Each chunk should represent a complete thought or idea. Keep together sentences that complement each other such when an example follows a statement
+2. Identify natural break points where the text can be divided into self-contained chunks following these guidelines:
+- Each chunk should represent a complete thought or idea. 
+- Keep together sentences that complement each other such one sentence makes statement and the next one provides an example.
+- It is ok not to break the text into chunks if it is already self-contained in which case you should return the entire text as a single chunk.
 
 3. Extract these chunks from the text, maintaining the original wording and punctuation within each chunk.
 
@@ -98,19 +101,23 @@ keyword_prompt = ChatPromptTemplate.from_messages([
 
 def split_text(state: GraphState) -> GraphState:
     chain = split_prompt | sonnet
+    if not state["text"] or state["text"].strip() == "Your input text here":
+        raise ValueError("Please provide actual text content to process")
     response = chain.invoke({"text": state["text"]})
 
     chunks = []
-    for chunk in response.content.split("\n\n"):
+    for i, chunk in enumerate(response.content.split("\n\n")):
         chunk_text = chunk.strip()
         if not chunk_text:
             continue
+        
+        print('\nChunk #', i, '\033[93m', chunk_text, '\033[0m')
 
         new_chunk = Chunk("", chunk_text)
-        print("Created chunk type:", type(new_chunk))
         chunks.append(new_chunk)
 
-    print('Text split into', len(chunks), 'chunks')
+    print('Text split into', len(chunks), 'chunks\n')
+
     return {"chunks": chunks, "index": -1}
 
 def get_chunk_from_state(state: GraphState, index: int) -> Chunk:
@@ -121,23 +128,24 @@ def get_chunk_from_state(state: GraphState, index: int) -> Chunk:
 
 def iterate_chunks(state: GraphState):
     currentIndex = state["index"] + 1
-    print("Iterate " + str(currentIndex) + "/" + str(len(state["chunks"])))
+    print("\033[91mIterate " + str(currentIndex + 1) + "/" + str(len(state["chunks"])) + "\033[0m")
     currentChunk = get_chunk_from_state(state, currentIndex)
-    print("Iterate chunk type:", type(currentChunk))
-
+    print("Text:\033[92m", currentChunk.text, "\033[0m")
     chain = keyword_prompt | sonnet
     response = chain.invoke({"text": currentChunk.text})
     currentChunk.metadata = response.content
+    print('Keywords:\033[92m', currentChunk.metadata, '\033[0m')
 
     state["index"] = currentIndex
     similar_doc = find_similar_chunk(state)
+    if similar_doc:
+        print('\033[91mSimilar chunk found\033[0m')
     state["similar_chunk"] = Chunk(similar_doc.metadata['keywords'], similar_doc.page_content) if similar_doc else None
 
     return state
 
 def find_similar_chunk(state: GraphState):
     chunk = get_chunk_from_state(state, state["index"])
-    print("Finding similar chunk type:", type(chunk))
     return indexes.findChunk(chunk)
 
 def chunk_action(state: GraphState):
@@ -147,19 +155,22 @@ def chunk_action(state: GraphState):
         return "prompt"
 
 def index_chunk(state: GraphState):
+    print('\033[93mIndexing chunk\033[0m')
     chunk = get_chunk_from_state(state, state["index"])
-    print("Index chunk type:", type(chunk))
-    print("Index chunk content:", chunk)
     
     indexes.addChunk(chunk)
     return state
 
 def prompt_chunk(state: GraphState, config: RunnableConfig):
-    print("Decide:" + str(state["index"]))
     similar_chunk = state["similar_chunk"]
     if isinstance(similar_chunk, dict):
         similar_chunk = Chunk(text=similar_chunk['text'], metadata=similar_chunk['metadata'])
-    print("Similar chunk has been indexed:" + str(similar_chunk))
+    print("\033[96mSimilar chunk has been indexed:\033[0m\n" + str(similar_chunk))
+
+    if not config.get("is_graph_studio"):
+        answer = input("Do you want to index this chunk? (y/n): ")
+        state["answer"] = answer
+        return state
     
     return {
         **state,
@@ -179,7 +190,7 @@ def end_check(state: GraphState):
     return state
 
 def is_end(state: GraphState):
-    print("IsEnd:" + str(state["index"]) + "/" + str(len(state["chunks"])))
+    print("\033[91mIsEnd:" + str(state["index"] + 1) + "/" + str(len(state["chunks"])) + "\033[0m\n")
     if state["index"] >= len(state["chunks"])-1:
         return END
     else:
@@ -204,3 +215,7 @@ workflow.add_conditional_edges(
 )
 
 app = workflow.compile()
+
+def create_app():
+    return app
+

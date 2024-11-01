@@ -1,1 +1,4 @@
 .env
+.venv
+.gradio/
+__pycache__/
