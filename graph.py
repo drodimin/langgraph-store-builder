@@ -10,6 +10,9 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
+from langchain_core.callbacks import adispatch_custom_event
+from langgraph.errors import NodeInterrupt
+from langgraph.checkpoint.memory import MemorySaver
 
 pc = Pinecone()
 pc_index_name = "langgraph-test"
@@ -99,7 +102,7 @@ keyword_prompt = ChatPromptTemplate.from_messages([
     ("human", prompt)
 ])
 
-def split_text(state: GraphState) -> GraphState:
+async def split_text(state: GraphState, config: RunnableConfig):
     chain = split_prompt | sonnet
     if not state["text"] or state["text"].strip() == "Your input text here":
         raise ValueError("Please provide actual text content to process")
@@ -112,11 +115,20 @@ def split_text(state: GraphState) -> GraphState:
             continue
         
         print('\nChunk #', i, '\033[93m', chunk_text, '\033[0m')
-
         new_chunk = Chunk("", chunk_text)
         chunks.append(new_chunk)
 
     print('Text split into', len(chunks), 'chunks\n')
+
+    # Send the full Chunk objects in the event
+    await adispatch_custom_event(
+        "on_text_split",
+        {
+            "chunk_count": len(chunks),
+            "chunks": chunks  # Send complete Chunk objects
+        },
+        config=config
+    )
 
     return {"chunks": chunks, "index": -1}
 
@@ -126,21 +138,37 @@ def get_chunk_from_state(state: GraphState, index: int) -> Chunk:
         return Chunk(text=chunk_data['text'], metadata=chunk_data['metadata'])
     return chunk_data
 
-def iterate_chunks(state: GraphState):
+async def iterate_chunks(state: GraphState):
     currentIndex = state["index"] + 1
     print("\033[91mIterate " + str(currentIndex + 1) + "/" + str(len(state["chunks"])) + "\033[0m")
     currentChunk = get_chunk_from_state(state, currentIndex)
     print("Text:\033[92m", currentChunk.text, "\033[0m")
+    
+    # Get keywords for the current chunk
     chain = keyword_prompt | sonnet
     response = chain.invoke({"text": currentChunk.text})
     currentChunk.metadata = response.content
     print('Keywords:\033[92m', currentChunk.metadata, '\033[0m')
 
+    # Update the chunk in the state with its new metadata
+    state["chunks"][currentIndex] = currentChunk
     state["index"] = currentIndex
+    
+    # Find similar chunks
     similar_doc = find_similar_chunk(state)
     if similar_doc:
         print('\033[91mSimilar chunk found\033[0m')
     state["similar_chunk"] = Chunk(similar_doc.metadata['keywords'], similar_doc.page_content) if similar_doc else None
+
+    # Dispatch event for UI update with new metadata
+    await adispatch_custom_event(
+        "on_chunk_metadata_update",
+        {
+            "chunk_index": currentIndex,
+            "chunk": currentChunk
+        },
+        config=RunnableConfig()
+    )
 
     return state
 
@@ -154,39 +182,86 @@ def chunk_action(state: GraphState):
     else:
         return "prompt"
 
-def index_chunk(state: GraphState):
+async def index_chunk(state: GraphState):
     print('\033[93mIndexing chunk\033[0m')
+    state["answer"] = None
     chunk = get_chunk_from_state(state, state["index"])
     
     indexes.addChunk(chunk)
+
+    await adispatch_custom_event(
+        "on_chunk_result",
+        {
+            "chunk_index": state["index"],
+            "result": "Indexed"
+        },
+        config=RunnableConfig()
+    )
+
     return state
 
-def prompt_chunk(state: GraphState, config: RunnableConfig):
+async def prompt_chunk(state: GraphState, config: RunnableConfig):
+    answer = state.get("answer")
+    print("\033[91mEntering prompt_chunk\033[0m, answer:", answer)
     similar_chunk = state["similar_chunk"]
     if isinstance(similar_chunk, dict):
         similar_chunk = Chunk(text=similar_chunk['text'], metadata=similar_chunk['metadata'])
-    print("\033[96mSimilar chunk has been indexed:\033[0m\n" + str(similar_chunk))
-
-    if not config.get("is_graph_studio"):
-        answer = input("Do you want to index this chunk? (y/n): ")
-        state["answer"] = answer
-        return state
     
-    return {
-        **state,
-        "waiting_for_input": True,
-        "options": ["y", "n"],
-        "prompt_message": "Do you still want to index this chunk?",
-        "answer": None
-    }
+    if answer is not None:
+        return {
+            **state,
+            "answer": answer,
+            "similar_chunk": None
+        }
+    
+    current_chunk = get_chunk_from_state(state, state["index"])
+    await adispatch_custom_event(
+        "on_similar_chunk_found", 
+        {
+            "chunk_index": state["index"],
+            "chunk_text": similar_chunk.text,
+            "chunk_keywords": similar_chunk.metadata,
+            "current_chunk": current_chunk  # Include the current chunk with its metadata
+        }, 
+        config=config
+    )
+    
+    if config.get("is_graph_studio"):
+        return {
+            **state,
+            "waiting_for_input": True,
+            "options": ["y", "n"],
+            "prompt_message": "Do you want to index this chunk?",
+        }
+    
+    print("\033[93mRaising interrupt for user decision\033[0m")
+    raise NodeInterrupt("Do you want to index this chunk?")
 
-def process_decision(state: GraphState):
-    if state.get("answer") == "y":
-        return "store"
+async def process_decision(state: GraphState):
+    print("\033[93mEntering process_decision with state\033[0m")
+    answer = state.get("answer")
+    
+    print(f"\033[93mProcessing decision with answer: {answer}\033[0m")
+
+    if answer == "y":
+        result = "store"
     else:
-        return "endcheck"
+        result = "endcheck"
+        await adispatch_custom_event(
+            "on_chunk_result",
+            {
+                "chunk_index": state["index"],
+                "result": "Skipped"
+            },
+            config=RunnableConfig()
+        )
+
+    
+    print(f"\033[93mDecision result: {result}\033[0m")
+    return result
 
 def end_check(state: GraphState):
+    state["answer"] = None
     return state
 
 def is_end(state: GraphState):
@@ -214,7 +289,9 @@ workflow.add_conditional_edges(
     {END: END, "iterate": "iterate"}
 )
 
-app = workflow.compile()
+memory = MemorySaver()
+print("memory saver is rerun")
+app = workflow.compile(checkpointer=memory)
 
 def create_app():
     return app
