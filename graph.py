@@ -13,9 +13,13 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.callbacks import adispatch_custom_event
 from langgraph.errors import NodeInterrupt
 from langgraph.checkpoint.memory import MemorySaver
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 pc = Pinecone()
-pc_index_name = "langgraph-test"
+pc_index_name = os.getenv("PINECONE_INDEX_NAME")
 
 if pc_index_name not in pc.list_indexes().names():
     pc.create_index(

@@ -13,18 +13,29 @@ def debug_print(container, message):
 
 thread_config = {"configurable": {"thread_id": "1"}}
 
-def display_text_chunks(chunks):
-    """Display text chunks in an expander with consistent formatting"""
-    with st.expander(f"Text is split into {len(chunks)} chunks:", expanded=True):
-        for i, chunk in enumerate(chunks, 1):
-            st.markdown(f"**Chunk {i}:**")
-            st.text_area(
-                label=f"Chunk {i}",
-                value=chunk,
-                height=100,
-                label_visibility="collapsed"
+def display_text_chunks(chunks, container):
+    debug_print(container, f"Displaying {len(chunks)} chunks")
+    with container.expander(f"Text is split into {len(chunks)} chunks:", expanded=True):
+        for i, chunk in enumerate(chunks, 0):
+            if f"title_placeholder_{i}" not in st.session_state:
+                st.session_state[f"title_placeholder_{i}"] = st.empty()
+            st.session_state[f"title_placeholder_{i}"].markdown(f"**Chunk {i+1}:**")
+            if f"metadata_placeholder_{i}" not in st.session_state:
+                debug_print(container, f"Creating metadata placeholder for chunk {i}")
+                st.session_state[f"metadata_placeholder_{i}"] = st.empty()
+            if chunk.metadata:
+                st.session_state[f"metadata_placeholder_{i}"].write(chunk.metadata)
+            if f"chunk_{i}_text" not in st.session_state:
+                debug_print(container, f"Creating text placeholder for chunk {i}")
+                st.session_state[f"text_placeholder_{i}"] = st.empty()
+            if chunk.text:
+                st.session_state[f"text_placeholder_{i}"].text_area(
+                    label=f"Chunk {i}",
+                    value=chunk.text,
+                    height=100,
+                    label_visibility="collapsed",
+                    key=f"chunk_{i}_text"
             )
-            st.divider()
 
 async def process_graph_events(text_input, placeholder, chunks_container, shared_state):
     """Handle graph events and UI updates"""
@@ -52,9 +63,12 @@ async def process_graph_events(text_input, placeholder, chunks_container, shared
             if name == "on_text_split":
                 st.session_state.text_chunks = event['data']['chunks']
                 st.session_state.chunks_received = True
-                
-                with chunks_container:
-                    display_text_chunks(st.session_state.text_chunks)
+                display_text_chunks(st.session_state.text_chunks, chunks_container)
+
+            elif name == "on_chunk_metadata_update":
+                index = event['data']['chunk_index']
+                st.session_state.text_chunks[event['data']['chunk_index']].metadata = event['data']['chunk'].metadata
+                st.session_state[f"metadata_placeholder_{index}"].write(st.session_state.text_chunks[event['data']['chunk_index']].metadata)
             
             elif name == "on_similar_chunk_found":
                 chunk_num = event['data']['chunk_index'] + 1  # Convert to 1-based index
@@ -126,9 +140,8 @@ with form_container:
             st.session_state.chunks_received = False  # Reset chunks flag on new submission
 
 # Always show chunks container
-with chunks_container:
-    if st.session_state.text_chunks and st.session_state.chunks_received:
-        display_text_chunks(st.session_state.text_chunks)
+if st.session_state.text_chunks and st.session_state.chunks_received:
+    display_text_chunks(st.session_state.text_chunks, chunks_container)
 
 # Process text and handle decisions
 if submit_button or st.session_state.graph_resume:
