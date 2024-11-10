@@ -72,6 +72,49 @@ split_prompt = ChatPromptTemplate.from_messages([
     ("human", prompt)
 ])
 
+prompt = """You are a text processing assistant. Your task is to analyze chunks of text and ensure each chunk has complete context by adding any missing information from previous chunks. Here's the text divided into chunks you'll be working with:
+
+<chunks>
+{chunks}
+</chunks>
+
+Please follow these steps for each chunk:
+
+1. Analyze the chunk for any undefined references such as:
+   - Pronouns (it, they, these, etc.)
+   - Demonstrative adjectives (this, that, these, those)
+   - Relative clauses that reference previous content
+   - Undefined proper nouns
+   - Continuation phrases ("also", "additionally", "furthermore")
+   - Any terms that rely on previous chunks for meaning
+
+2. For each undefined reference found:
+   - Locate the missing context in previous chunks
+   - Insert the minimal necessary context at the first relevant reference
+   - Maintain natural flow while adding context
+   - Use the exact wording from previous chunks when adding context
+
+3. Format the output following these rules:
+   - Present each modified chunk on a new line
+   - Separate chunks with an empty line
+   - Do not add any formatting or markers
+   - Present chunks in the same order as input
+   - If a chunk needs no modification, output it unchanged
+
+4. Do not:
+   - Add explanatory text or commentary
+   - Change the meaning or tone of the original
+   - Remove any original content
+   - Add information not present in the previous chunks
+   - Rewrite or rephrase content unless absolutely necessary for coherence
+
+Output only the resulting chunks, with or without modifications, separated by blank lines."""
+
+adjust_prompt = ChatPromptTemplate.from_messages([
+    ("system", ""),
+    ("human", prompt)
+])
+
 prompt = """You will be given a short chunk of text. Your task is to extract keywords from this text. Here is the text:
 
 <text>
@@ -123,16 +166,6 @@ async def split_text(state: GraphState, config: RunnableConfig):
         chunks.append(new_chunk)
 
     print('Text split into', len(chunks), 'chunks\n')
-
-    # Send the full Chunk objects in the event
-    await adispatch_custom_event(
-        "on_text_split",
-        {
-            "chunk_count": len(chunks),
-            "chunks": chunks  # Send complete Chunk objects
-        },
-        config=config
-    )
 
     return {"chunks": chunks, "index": -1}
 
@@ -208,6 +241,7 @@ async def prompt_chunk(state: GraphState, config: RunnableConfig):
     answer = state.get("answer")
     print("\033[91mEntering prompt_chunk\033[0m, answer:", answer)
     similar_chunk = state["similar_chunk"]
+    print("similar_chunk:", similar_chunk)
     if isinstance(similar_chunk, dict):
         similar_chunk = Chunk(text=similar_chunk['text'], metadata=similar_chunk['metadata'])
     
@@ -275,15 +309,45 @@ def is_end(state: GraphState):
     else:
         return "iterate"
 
+async def adjust_chunks(state: GraphState, config: RunnableConfig):
+    chain = adjust_prompt | sonnet
+    chunks_text = "\n\n".join(chunk.text for chunk in state["chunks"])
+    response = chain.invoke({"chunks": chunks_text})
+    
+    adjusted_chunks = []
+    for i, chunk_text in enumerate(response.content.split("\n\n")):
+        chunk_text = chunk_text.strip()
+        if not chunk_text:
+            continue
+        
+        print('\nAdjusted Chunk #', i, '\033[93m', chunk_text, '\033[0m')
+        new_chunk = Chunk("", chunk_text)
+        adjusted_chunks.append(new_chunk)
+
+    print('Adjusted', len(adjusted_chunks), 'chunks\n')
+
+    await adispatch_custom_event(
+        "on_text_split",
+        {
+            "chunk_count": len(adjusted_chunks),
+            "chunks": adjusted_chunks
+        },
+        config=config
+    )
+
+    return {"chunks": adjusted_chunks, "index": -1}
+
 workflow = StateGraph(GraphState, config_schema=Configuration)
 workflow.add_node("split", split_text)
+workflow.add_node("adjust", adjust_chunks)
 workflow.add_node("iterate", iterate_chunks)
 workflow.add_node("prompt", prompt_chunk)
 workflow.add_node("store", index_chunk)
 workflow.add_node("endcheck", end_check)
 
 workflow.add_edge(START, "split")
-workflow.add_edge("split", "iterate")
+workflow.add_edge("split", "adjust")
+workflow.add_edge("adjust", "iterate")
 workflow.add_conditional_edges("iterate", chunk_action)
 workflow.add_conditional_edges("prompt", process_decision)
 workflow.add_edge("store", "endcheck")
